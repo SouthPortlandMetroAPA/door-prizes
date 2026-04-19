@@ -321,9 +321,11 @@ body {
     <div class="card">
       <form id="registerForm" autocomplete="off">
         <div class="form-group">
-          <label for="memberInput">APA Member Number</label>
-          <input type="text" id="memberInput" inputmode="numeric" pattern="[0-9]*"
-                 placeholder="e.g. 12345678" autocomplete="off" required>
+          <label for="memberInput">APA Member Number <span class="hint" style="font-weight:400;color:var(--muted)">(8 digits)</span></label>
+          <input type="text" id="memberInput" inputmode="numeric" pattern="[0-9]{8}"
+                 minlength="8" maxlength="8"
+                 placeholder="12345678" autocomplete="off" required
+                 title="APA number must be exactly 8 digits">
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -471,6 +473,13 @@ registerForm.addEventListener('submit', async (e) => {
   const lastName     = lastInput.value.trim();
   if (!memberNumber || !firstName || !lastName) {
     return showBanner('error', 'APA number, first name, and last name are all required.', 4000);
+  }
+  // Shape-only check — we don't look the number up anywhere, just
+  // make sure it's a plausible APA#. Browser's pattern/minlength
+  // already gates submission in most cases; this catches paste-over
+  // or autofill weirdness.
+  if (!/^[0-9]{8}$/.test(memberNumber)) {
+    return showBanner('error', 'APA number must be exactly 8 digits.', 4500);
   }
 
   submitBtn.disabled = true;
