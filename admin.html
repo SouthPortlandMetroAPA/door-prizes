@@ -323,9 +323,6 @@ html, body {
       <h2>Status</h2>
       <div class="stats">
         <div class="stat"><div class="num" id="statTotal">0</div><div class="label">Registered</div></div>
-        <div class="stat"><div class="num" id="statPending">0</div><div class="label">Pending</div></div>
-        <div class="stat"><div class="num" id="statSkipped">0</div><div class="label">Skipped</div></div>
-        <div class="stat"><div class="num" id="statWon">0</div><div class="label">Winners</div></div>
         <div class="stat"><div class="num" id="statLocked">&mdash;</div><div class="label">Lock</div></div>
       </div>
 
@@ -511,9 +508,6 @@ function renderStats() {
   const won     = entries.filter(e => e.status === 'won').length;
 
   document.getElementById('statTotal').textContent   = total;
-  document.getElementById('statPending').textContent = pending;
-  document.getElementById('statSkipped').textContent = skipped;
-  document.getElementById('statWon').textContent     = won;
   document.getElementById('statLocked').textContent  = locked ? 'ON' : 'OFF';
 
   const btnLock  = document.getElementById('btnLockRandomize');
