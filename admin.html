@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+============================================================================
+Door Prize Drawing — Admin
+============================================================================
+
+PURPOSE:
+  Admin controls for the door prize / Chinook Winds $1200 drawing.
+  Before the draw: view entries, delete accidents. One button: "Lock &
+  Randomize" which closes registration (RLS-enforced) and assigns a
+  random draw_order 1..N via a crypto-seeded Fisher-Yates shuffle.
+  During the draw: the next pending row is highlighted; admin marks
+  "WINNER!" or "Not here (skip)". Redraw = skip → next pending. One
+  winner ends the session (per the $1200 prize spec); admin can Reset
+  to run another round or clear everything.
+
+AUTH:
+  ?key=<service_role_key>. Validated on load.
+
+RANDOMNESS:
+  Fisher-Yates shuffle seeded from crypto.getRandomValues(). Browser
+  PRNG isn't reliable for real randomness; this uses the same crypto
+  RNG that powers UUIDs and session tokens — indistinguishable from
+  random for a 30-to-300-entry pool.
+
+RLS INTERACTION:
+  door_prize_state.locked is the source of truth. Setting it to true
+  causes the anon_insert_entries_when_unlocked policy to reject
+  further registration attempts at the database layer.
+============================================================================
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Door Prize &mdash; Admin</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --primary: #c2b280;
+  --primary-dark: #b5a574;
+  --bg: #f5f0e8;
+  --text: #111;
+  --card: #fff;
+  --muted: #666;
+  --border: #d4c9a8;
+  --radius: 10px;
+  --success: #2e7d32;
+  --danger: #c0392b;
+  --warn: #8a6d1b;
+  --accent: #8a2f1c;
+  --shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+html, body {
+  margin: 0; padding: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 16px; line-height: 1.5;
+  background: var(--bg); color: var(--text);
+}
+.page { max-width: 1040px; margin: 0 auto; padding: 16px; }
+
+/* ── Header ── */
+.header {
+  background: var(--primary);
+  padding: 24px 16px 28px;
+  text-align: center;
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+  position: relative;
+  overflow: hidden;
+}
+.header h1 { margin: 0; font-size: 1.45rem; font-weight: 800; letter-spacing: 0.01em; }
+.header .subtitle { font-size: 1rem; color: rgba(0,0,0,0.6); margin-top: 2px; }
+.admin-badge {
+  position: absolute; top: 8px; right: 10px;
+  background: var(--danger); color: #fff;
+  font-size: 0.7rem; font-weight: 700;
+  padding: 3px 8px; border-radius: 999px;
+  letter-spacing: 0.06em;
+}
+
+/* ── Cards ── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.card h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 800;
+}
+.hint { color: var(--muted); font-size: 0.85rem; }
+
+/* Key gate */
+.key-gate { text-align: center; padding: 40px 16px; }
+.key-gate .card { max-width: 420px; margin: 0 auto; }
+
+/* Stats row */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+}
+.stat {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fafaf4;
+  text-align: center;
+}
+.stat .num { font-size: 1.6rem; font-weight: 800; line-height: 1.1; color: var(--accent); }
+.stat .label {
+  font-size: 0.7rem; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Action bar */
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+/* Buttons */
+.btn {
+  min-height: 44px;
+  padding: 10px 16px;
+  font: inherit; font-weight: 700; font-size: 0.95rem;
+  border-radius: var(--radius);
+  border: none; cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+.btn-primary  { background: var(--primary); color: #111; }
+.btn-primary:hover:not(:disabled) { background: var(--primary-dark); }
+.btn-primary:disabled { background: #ddd; color: #888; cursor: not-allowed; }
+.btn-big-green { background: #2e7d32; color: #fff; font-size: 1.05rem; }
+.btn-big-green:hover:not(:disabled) { background: #1b5e20; }
+.btn-big-red { background: var(--danger); color: #fff; font-size: 1.05rem; }
+.btn-big-red:hover:not(:disabled) { background: #7a1d14; }
+.btn-outline { background: #fff; border: 1px solid var(--border); color: var(--text); }
+.btn-outline:hover:not(:disabled) { background: #faf8f3; }
+.btn-danger  { background: var(--danger); color: #fff; }
+.btn-danger:hover:not(:disabled) { background: #9a221a; }
+.btn-sm { min-height: 32px; padding: 4px 10px; font-size: 0.8rem; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Hint banner */
+.draw-hint {
+  font-size: 0.9rem;
+  color: var(--warn);
+  background: #fff4d6;
+  border: 1px solid #f0dfa3;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-top: 10px;
+}
+.draw-hint.ok { color: var(--success); background: #e8f5e9; border-color: #c8e6c9; }
+
+/* Status line */
+.status-line {
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  font-size: 0.9rem;
+  display: none;
+  margin-bottom: 12px;
+}
+.status-line.shown { display: block; }
+.status-line.ok  { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+.status-line.err { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+/* Big reveal card (post-lock) */
+.reveal {
+  border: 2px solid var(--primary);
+  background: linear-gradient(180deg, #fffbec 0%, #fff 70%);
+  border-radius: 14px;
+  padding: 28px 20px;
+  text-align: center;
+  box-shadow: 0 6px 24px rgba(194, 178, 128, 0.35);
+  margin-bottom: 16px;
+}
+.reveal .position {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.reveal .position-num {
+  display: inline-block;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 999px;
+  padding: 2px 10px;
+  margin-left: 6px;
+  letter-spacing: 0.08em;
+}
+.reveal .big-name {
+  font-size: clamp(2rem, 1.5rem + 3vw, 3.25rem);
+  font-weight: 900;
+  line-height: 1.05;
+  margin: 10px 0 8px;
+  color: var(--text);
+  word-break: break-word;
+}
+.reveal .apa-num {
+  font-size: 1rem;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+  margin-bottom: 22px;
+}
+.reveal .draw-actions {
+  display: flex; flex-direction: column; gap: 10px;
+  max-width: 380px; margin: 0 auto;
+}
+.reveal .draw-actions .btn { width: 100%; min-height: 56px; }
+
+.reveal.done {
+  border-color: var(--success);
+  background: linear-gradient(180deg, #e9f7ea 0%, #fff 70%);
+}
+.reveal.done .position, .reveal.done .position-num { color: var(--success); background: var(--success); color: #fff; }
+.reveal.done .crown-big {
+  font-size: 3rem;
+  display: block;
+  margin-bottom: 4px;
+}
+.reveal.empty {
+  border-style: dashed;
+  border-color: var(--border);
+  background: #fff;
+}
+
+/* Table */
+.table-wrap { overflow-x: auto; }
+.table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.table th, .table td {
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: middle;
+  border-bottom: 1px solid #f0e9d4;
+}
+.table th {
+  background: #faf8f3;
+  font-weight: 800; font-size: 0.75rem;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--accent);
+}
+.table tr.current td { background: #fffbec; font-weight: 700; }
+.table tr:hover td { background: #fdfbf3; }
+.table tr.current:hover td { background: #fff6d8; }
+
+/* Badges */
+.badge {
+  display: inline-block;
+  font-size: 0.7rem; font-weight: 700;
+  padding: 2px 8px; border-radius: 999px;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.badge.pending { background: #eceae1; color: #555; }
+.badge.won     { background: #c8e6c9; color: #155724; }
+.badge.skipped { background: #eeeeee; color: #888; text-decoration: line-through; }
+.badge.pos     { background: var(--primary); color: #111; }
+
+.search-box {
+  width: 100%; max-width: 320px;
+  min-height: 40px;
+  padding: 8px 12px;
+  font: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(0,0,0,0.2);
+  border-top-color: #000;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.hidden { display: none !important; }
+.footer { text-align: center; padding: 16px; font-size: 0.75rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <div class="header">
+    <div class="admin-badge">ADMIN</div>
+    <h1>Door Prize Drawing</h1>
+    <div class="subtitle">Admin</div>
+  </div>
+
+  <!-- Key gate -->
+  <div id="keyGate" class="key-gate hidden">
+    <div class="card">
+      <h2 id="keyGateTitle">Admin key required</h2>
+      <p class="hint" id="keyGateMsg">This page needs an admin key. Add <code>?key=&lt;service_role&gt;</code> to the URL.</p>
+    </div>
+  </div>
+
+  <!-- Main admin -->
+  <div id="adminMain" class="hidden">
+
+    <!-- Stats + lock action -->
+    <div class="card">
+      <h2>Status</h2>
+      <div class="stats">
+        <div class="stat"><div class="num" id="statTotal">0</div><div class="label">Registered</div></div>
+        <div class="stat"><div class="num" id="statPending">0</div><div class="label">Pending</div></div>
+        <div class="stat"><div class="num" id="statSkipped">0</div><div class="label">Skipped</div></div>
+        <div class="stat"><div class="num" id="statWon">0</div><div class="label">Winners</div></div>
+        <div class="stat"><div class="num" id="statLocked">&mdash;</div><div class="label">Lock</div></div>
+      </div>
+
+      <div id="drawHint" class="draw-hint hidden"></div>
+
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="btnLockRandomize" onclick="lockAndRandomize()" disabled>
+          &#128274; Lock &amp; Randomize
+        </button>
+        <button type="button" class="btn btn-danger" id="btnReset" onclick="resetDrawing()" disabled>
+          &#8635; Reset Drawing
+        </button>
+      </div>
+    </div>
+
+    <!-- Current draw (only shown post-lock) -->
+    <div id="revealWrap" class="hidden">
+      <div class="card reveal" id="revealCard"></div>
+    </div>
+
+    <!-- Players list -->
+    <div class="card">
+      <h2 id="listTitle">Entries</h2>
+      <div id="statusLine" class="status-line"></div>
+      <div style="margin-bottom: 8px">
+        <input type="text" class="search-box" id="searchBox" placeholder="Search name or APA#&hellip;" oninput="renderList()">
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead id="tableHead">
+            <tr>
+              <th style="width:36px">#</th>
+              <th>APA#</th>
+              <th>Name</th>
+              <th>Status</th>
+              <th style="text-align:right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody">
+            <tr><td colspan="5" class="hint">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="footer">Door Prize Admin &middot; v0.1</div>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+   CONFIG
+   ══════════════════════════════════════════════════════════════════════ */
+const SB_URL  = 'https://dqzbekoaysgaiqljueac.supabase.co';
+const SB_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRxemJla29heXNnYWlxbGp1ZWFjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUxNzA5NzgsImV4cCI6MjA5MDc0Njk3OH0.cCdGxZ4zEFzU_r6lWSDeoNWG67Q4MSYCAtpds035dfU';
+const params  = new URLSearchParams(location.search);
+const SB_KEY  = params.get('key') || '';
+const HEADERS = SB_KEY
+  ? { apikey: SB_KEY, Authorization: 'Bearer ' + SB_KEY }
+  : { apikey: SB_ANON, Authorization: 'Bearer ' + SB_ANON };
+const WRITE_HEADERS = { ...HEADERS, 'Content-Type': 'application/json', Prefer: 'return=representation' };
+
+/* ══════════════════════════════════════════════════════════════════════
+   STATE
+   ══════════════════════════════════════════════════════════════════════ */
+let entries = [];       // full list
+let locked  = false;
+let writeInFlight = false;
+let pollHandle = null;
+
+/* ══════════════════════════════════════════════════════════════════════
+   HELPERS
+   ══════════════════════════════════════════════════════════════════════ */
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+function showStatus(msg, ok) {
+  const el = document.getElementById('statusLine');
+  el.className = 'status-line shown ' + (ok ? 'ok' : 'err');
+  el.innerHTML = msg;
+  if (ok) setTimeout(() => { el.className = 'status-line'; el.innerHTML = ''; }, 4000);
+}
+
+async function sbGet(path) {
+  const res = await fetch(SB_URL + '/rest/v1/' + path, { headers: HEADERS });
+  if (!res.ok) throw new Error(res.status + ' ' + (await res.text()));
+  return res.json();
+}
+async function sbPatch(path, body) {
+  const res = await fetch(SB_URL + '/rest/v1/' + path, {
+    method: 'PATCH', headers: WRITE_HEADERS, body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(res.status + ' ' + (await res.text()));
+  return res.json();
+}
+async function sbDelete(path) {
+  const res = await fetch(SB_URL + '/rest/v1/' + path, { method: 'DELETE', headers: HEADERS });
+  if (!res.ok) throw new Error(res.status + ' ' + (await res.text()));
+}
+
+/**
+ * Cryptographically-seeded Fisher-Yates shuffle.
+ *
+ * Math.random() is fine for toy shuffles but it's seeded by the
+ * runtime and observable/predictable in some environments. This
+ * uses crypto.getRandomValues() so each swap's index is drawn from
+ * OS entropy — the same source Supabase uses for session tokens and
+ * the same source node crypto.randomUUID uses.
+ */
+function cryptoShuffle(arr) {
+  const a = arr.slice();
+  const n = a.length;
+  for (let i = n - 1; i > 0; i--) {
+    // Rejection-sample an unbiased integer in [0, i].
+    const range = i + 1;
+    const maxAccept = Math.floor(0x100000000 / range) * range;
+    const buf = new Uint32Array(1);
+    let r;
+    do {
+      crypto.getRandomValues(buf);
+      r = buf[0];
+    } while (r >= maxAccept);
+    const j = r % range;
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   INIT
+   ══════════════════════════════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded', async () => {
+  if (!SB_KEY) return document.getElementById('keyGate').classList.remove('hidden');
+  try {
+    const r = await fetch(SB_URL + '/rest/v1/door_prize_entries?select=id&limit=1', { headers: HEADERS });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    const g = document.getElementById('keyGate');
+    g.classList.remove('hidden');
+    document.getElementById('keyGateTitle').textContent = 'Access Denied';
+    document.getElementById('keyGateMsg').innerHTML =
+      '<strong style="color:var(--danger)">Admin key is invalid or expired.</strong><br>Double-check <code>?key=</code>.';
+    return;
+  }
+
+  document.getElementById('adminMain').classList.remove('hidden');
+  await loadAll();
+  startPolling();
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   LOAD + RENDER
+   ══════════════════════════════════════════════════════════════════════ */
+async function loadAll() {
+  try {
+    const [rows, state] = await Promise.all([
+      sbGet('door_prize_entries?select=*&order=draw_order.asc.nullslast,registered_at.asc'),
+      sbGet('door_prize_state?select=locked&limit=1')
+    ]);
+    entries = rows;
+    locked  = state.length ? !!state[0].locked : false;
+    renderStats();
+    renderReveal();
+    renderList();
+  } catch (e) {
+    showStatus('Failed to load: ' + esc(e.message), false);
+  }
+}
+
+function pendingList() {
+  return entries
+    .filter(e => e.status === 'pending' && e.draw_order != null)
+    .sort((a, b) => a.draw_order - b.draw_order);
+}
+
+function renderStats() {
+  const total   = entries.length;
+  const pending = entries.filter(e => e.status === 'pending').length;
+  const skipped = entries.filter(e => e.status === 'skipped').length;
+  const won     = entries.filter(e => e.status === 'won').length;
+
+  document.getElementById('statTotal').textContent   = total;
+  document.getElementById('statPending').textContent = pending;
+  document.getElementById('statSkipped').textContent = skipped;
+  document.getElementById('statWon').textContent     = won;
+  document.getElementById('statLocked').textContent  = locked ? 'ON' : 'OFF';
+
+  const btnLock  = document.getElementById('btnLockRandomize');
+  const btnReset = document.getElementById('btnReset');
+  const hint     = document.getElementById('drawHint');
+
+  // Lock & Randomize button state
+  if (locked) {
+    btnLock.disabled = true;
+    btnLock.innerHTML = '&#128274; Locked';
+  } else {
+    btnLock.innerHTML = '&#128274; Lock &amp; Randomize';
+    btnLock.disabled = total === 0;
+  }
+
+  // Reset always available once anything is in progress (locked or any draw_order set)
+  const anyDrawn = locked || entries.some(e => e.draw_order != null);
+  btnReset.disabled = !anyDrawn;
+
+  // Hint / status messaging
+  if (!locked) {
+    if (total === 0) {
+      hint.className = 'draw-hint';
+      hint.textContent = 'No entries yet. Waiting on registrations.';
+    } else {
+      hint.className = 'draw-hint ok';
+      hint.textContent = total + ' entr' + (total === 1 ? 'y' : 'ies') + ' ready. Click Lock & Randomize when you\u2019re ready to draw.';
+    }
+    hint.classList.remove('hidden');
+    return;
+  }
+
+  // Post-lock
+  if (won > 0) {
+    hint.className = 'draw-hint ok';
+    hint.textContent = 'Winner confirmed. Drawing complete.';
+  } else if (pending === 0) {
+    hint.className = 'draw-hint';
+    hint.textContent = 'All entries exhausted without a winner. Reset to run another draw.';
+  } else {
+    hint.className = 'draw-hint ok';
+    hint.textContent = 'Drawing live \u2014 ' + pending + ' name' + (pending === 1 ? '' : 's') + ' still to call.';
+  }
+  hint.classList.remove('hidden');
+}
+
+function renderReveal() {
+  const wrap = document.getElementById('revealWrap');
+  const card = document.getElementById('revealCard');
+
+  if (!locked) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  wrap.classList.remove('hidden');
+
+  const winner = entries.find(e => e.status === 'won');
+  if (winner) {
+    card.className = 'card reveal done';
+    card.innerHTML =
+      '<span class="crown-big">&#127942;</span>'
+      + '<div class="position">Winner</div>'
+      + '<div class="big-name">' + esc(winner.first_name + ' ' + winner.last_name) + '</div>'
+      + '<div class="apa-num">#' + esc(winner.member_number) + '</div>'
+      + '<p class="hint">Drawing complete. Reset to run another round.</p>';
+    return;
+  }
+
+  const next = pendingList()[0];
+  if (!next) {
+    card.className = 'card reveal empty';
+    card.innerHTML =
+      '<div class="position">No pending names left</div>'
+      + '<p class="hint" style="margin-top:10px">All entries were skipped. Reset the drawing to start over.</p>';
+    return;
+  }
+
+  card.className = 'card reveal';
+  card.innerHTML =
+    '<div class="position">Up Next <span class="position-num">#' + next.draw_order + '</span></div>'
+    + '<div class="big-name">' + esc(next.first_name + ' ' + next.last_name) + '</div>'
+    + '<div class="apa-num">APA #' + esc(next.member_number) + '</div>'
+    + '<div class="draw-actions">'
+      + '<button class="btn btn-big-green" onclick="markWinner(' + next.id + ')">&#127942; Confirm Winner &mdash; $1200</button>'
+      + '<button class="btn btn-big-red" onclick="markSkipped(' + next.id + ')">&#10060; Not Here \u2014 Skip &amp; Redraw</button>'
+    + '</div>';
+}
+
+function renderList() {
+  const body = document.getElementById('tableBody');
+  const title = document.getElementById('listTitle');
+  const q = (document.getElementById('searchBox').value || '').toLowerCase().trim();
+
+  title.textContent = locked ? 'Draw Order' : 'Entries';
+
+  const rows = entries
+    .slice()
+    .sort((a, b) => {
+      // Post-lock: show in draw_order. Pre-lock: registration order.
+      if (locked) return (a.draw_order ?? 1e9) - (b.draw_order ?? 1e9);
+      return new Date(a.registered_at) - new Date(b.registered_at);
+    })
+    .filter(e => {
+      if (!q) return true;
+      return (e.first_name + ' ' + e.last_name + ' ' + e.member_number).toLowerCase().indexOf(q) !== -1;
+    });
+
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="5" class="hint">'
+      + (q ? 'No matches.' : 'No entries yet.')
+      + '</td></tr>';
+    return;
+  }
+
+  // Identify the current "up next" pending row for highlighting.
+  const winner = entries.find(e => e.status === 'won');
+  const nextPending = !winner ? pendingList()[0] : null;
+
+  body.innerHTML = rows.map(e => {
+    const isCurrent = nextPending && nextPending.id === e.id;
+    const posCell = locked && e.draw_order != null
+      ? '<span class="badge pos">#' + e.draw_order + '</span>'
+      : '<span class="hint">\u2014</span>';
+
+    let statusCell;
+    if (e.status === 'won')      statusCell = '<span class="badge won">Winner</span>';
+    else if (e.status === 'skipped') statusCell = '<span class="badge skipped">Skipped</span>';
+    else                         statusCell = '<span class="badge pending">Pending</span>';
+
+    let actions = '';
+    if (!locked) {
+      actions = '<button class="btn btn-outline btn-sm" onclick="deleteEntry(' + e.id + ',\'' + esc(e.first_name + ' ' + e.last_name).replace(/'/g, "\\u0027") + '\')">Delete</button>';
+    } else if (e.status === 'pending' && !winner) {
+      actions =
+        '<button class="btn btn-outline btn-sm" onclick="markSkipped(' + e.id + ')" style="margin-right:4px">Skip</button>'
+        + '<button class="btn btn-outline btn-sm" onclick="markWinner(' + e.id + ')">Winner</button>';
+    } else if (e.status === 'skipped' && !winner) {
+      actions = '<button class="btn btn-outline btn-sm" onclick="markPending(' + e.id + ')">Un-skip</button>';
+    }
+
+    return '<tr' + (isCurrent ? ' class="current"' : '') + '>'
+      + '<td>' + posCell + '</td>'
+      + '<td>' + esc(e.member_number) + '</td>'
+      + '<td>' + esc(e.first_name + ' ' + e.last_name) + '</td>'
+      + '<td>' + statusCell + '</td>'
+      + '<td style="text-align:right">' + actions + '</td>'
+    + '</tr>';
+  }).join('');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   OPERATIONS
+   ══════════════════════════════════════════════════════════════════════ */
+
+async function deleteEntry(id, displayName) {
+  if (locked) return showStatus('Drawing is locked \u2014 reset first.', false);
+  if (!confirm('Delete ' + displayName + '? This cannot be undone.')) return;
+  writeInFlight = true;
+  try {
+    await sbDelete('door_prize_entries?id=eq.' + id);
+    entries = entries.filter(e => e.id !== id);
+    renderStats();
+    renderList();
+    showStatus('Deleted ' + displayName + '.', true);
+  } catch (e) {
+    showStatus('Delete failed: ' + esc(e.message), false);
+  } finally {
+    writeInFlight = false;
+  }
+}
+window.deleteEntry = deleteEntry;
+
+async function lockAndRandomize() {
+  if (locked) return;
+  if (entries.length === 0) return showStatus('No entries to draw from.', false);
+  if (!confirm('Lock registrations and randomize ' + entries.length + ' entr' + (entries.length === 1 ? 'y' : 'ies') + '?\n\nAfter locking, no new registrations can be submitted.')) return;
+
+  const btn = document.getElementById('btnLockRandomize');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Randomizing\u2026';
+  writeInFlight = true;
+
+  try {
+    // Crypto-seeded Fisher-Yates across all current entries.
+    const shuffled = cryptoShuffle(entries);
+    const now = new Date().toISOString();
+
+    // Assign draw_order 1..N and reset any stale status.
+    // Run PATCHes in parallel — N is small (tens to low hundreds).
+    await Promise.all(shuffled.map((e, idx) =>
+      sbPatch('door_prize_entries?id=eq.' + e.id, {
+        draw_order: idx + 1,
+        status: 'pending',
+        updated_at: now
+      })
+    ));
+
+    // Flip the state lock (RLS blocks further anon INSERTs once true).
+    await sbPatch('door_prize_state?id=eq.1', { locked: true, updated_at: now });
+
+    await loadAll();
+    showStatus('Drawing locked \u2014 ' + shuffled.length + ' entr' + (shuffled.length === 1 ? 'y' : 'ies') + ' randomized.', true);
+  } catch (e) {
+    showStatus('Lock failed: ' + esc(e.message), false);
+    await loadAll();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '&#128274; Lock &amp; Randomize';
+    writeInFlight = false;
+  }
+}
+window.lockAndRandomize = lockAndRandomize;
+
+async function markWinner(id) {
+  const e = entries.find(x => x.id === id);
+  if (!e) return;
+  if (!confirm('Mark ' + e.first_name + ' ' + e.last_name + ' as the $1200 winner?\n\nThis closes the drawing. Reset if you need to continue.')) return;
+
+  writeInFlight = true;
+  try {
+    await sbPatch('door_prize_entries?id=eq.' + id, {
+      status: 'won',
+      updated_at: new Date().toISOString()
+    });
+    e.status = 'won';
+    renderStats();
+    renderReveal();
+    renderList();
+    showStatus('Winner: ' + e.first_name + ' ' + e.last_name + '.', true);
+  } catch (err) {
+    showStatus('Failed: ' + esc(err.message), false);
+    await loadAll();
+  } finally {
+    writeInFlight = false;
+  }
+}
+window.markWinner = markWinner;
+
+async function markSkipped(id) {
+  const e = entries.find(x => x.id === id);
+  if (!e) return;
+  writeInFlight = true;
+  try {
+    await sbPatch('door_prize_entries?id=eq.' + id, {
+      status: 'skipped',
+      updated_at: new Date().toISOString()
+    });
+    e.status = 'skipped';
+    renderStats();
+    renderReveal();
+    renderList();
+  } catch (err) {
+    showStatus('Failed: ' + esc(err.message), false);
+    await loadAll();
+  } finally {
+    writeInFlight = false;
+  }
+}
+window.markSkipped = markSkipped;
+
+async function markPending(id) {
+  const e = entries.find(x => x.id === id);
+  if (!e) return;
+  writeInFlight = true;
+  try {
+    await sbPatch('door_prize_entries?id=eq.' + id, {
+      status: 'pending',
+      updated_at: new Date().toISOString()
+    });
+    e.status = 'pending';
+    renderStats();
+    renderReveal();
+    renderList();
+  } catch (err) {
+    showStatus('Failed: ' + esc(err.message), false);
+    await loadAll();
+  } finally {
+    writeInFlight = false;
+  }
+}
+window.markPending = markPending;
+
+async function resetDrawing() {
+  const hasWinner = entries.some(e => e.status === 'won');
+  const msg = hasWinner
+    ? 'Reset will clear the current winner, unlock registration, and wipe all draw order. Are you sure?'
+    : 'Reset will unlock registration and clear all draw order + statuses. Entries stay registered. Are you sure?';
+  if (!confirm(msg)) return;
+
+  const btn = document.getElementById('btnReset');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Resetting\u2026';
+  writeInFlight = true;
+
+  try {
+    const now = new Date().toISOString();
+    // Bulk PATCH all entries back to pending state and null draw_order.
+    const r = await fetch(SB_URL + '/rest/v1/door_prize_entries?id=gt.0', {
+      method: 'PATCH',
+      headers: WRITE_HEADERS,
+      body: JSON.stringify({ status: 'pending', draw_order: null, updated_at: now })
+    });
+    if (!r.ok) throw new Error(r.status + ' ' + (await r.text()));
+    await sbPatch('door_prize_state?id=eq.1', { locked: false, updated_at: now });
+    await loadAll();
+    showStatus('Drawing reset.', true);
+  } catch (e) {
+    showStatus('Reset failed: ' + esc(e.message), false);
+    await loadAll();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '&#8635; Reset Drawing';
+    writeInFlight = false;
+  }
+}
+window.resetDrawing = resetDrawing;
+
+/* ══════════════════════════════════════════════════════════════════════
+   POLLING — pick up new registrations without a manual refresh.
+   Same pattern as Pool Gods: skip while writing or while the tab is
+   hidden so we don't clobber local state or burn API calls.
+   ══════════════════════════════════════════════════════════════════════ */
+function startPolling() {
+  if (pollHandle) return;
+  pollHandle = setInterval(async () => {
+    if (writeInFlight || document.hidden) return;
+    try { await loadAll(); } catch { /* soft-fail */ }
+  }, 30000);
+}
+</script>
+</body>
+</html>
